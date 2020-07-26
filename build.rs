@@ -115,7 +115,6 @@ fn main() {
     let use_system_libs = there_is_env("CARGO_FEATURE_USE_SYSTEM_LIBS");
     if use_system_libs {
         match target {
-            Target::Msvc => panic!("the use-system-libs feature is not supported on this target"),
             Target::Mingw => mingw_pkg_config_libdir_or_panic(),
             _ => {}
         }
@@ -159,27 +158,81 @@ fn check_system_libs(env: &Environment) {
     println!("$ cd {:?}", try_dir);
     let mut cmd;
 
-    println!("$ #Check for system GMP");
-    create_file_or_panic(&try_dir.join("system_gmp.c"), SYSTEM_GMP_C);
-
-    cmd = Command::new("gcc");
-    cmd.current_dir(&try_dir)
-        .args(&["-fPIC", "system_gmp.c", "-lgmp", "-o", "system_gmp.exe"]);
-    execute(cmd);
-
-    cmd = Command::new(try_dir.join("system_gmp.exe"));
-    cmd.current_dir(&try_dir);
-    execute(cmd);
-    process_gmp_header(
-        &try_dir.join("system_gmp.out"),
-        Some(&env.out_dir.join("gmp_h.rs")),
-    )
-    .unwrap_or_else(|e| panic!("{}", e));
-
     let feature_mpfr = there_is_env("CARGO_FEATURE_MPFR");
     let feature_mpc = there_is_env("CARGO_FEATURE_MPC");
+    let feature_use_mpir = there_is_env("CARGO_FEATURE_USE_MPIR");
+
+    let mut mpir_lib_path = None;
+
+    if feature_use_mpir {
+        if env.target != Target::Msvc {
+            panic!("the use-mpir feature is currently only supported with Windows (MSVC)");
+        }
+
+        println!("$ #Locate MSVC");
+        let programFiles = std::env::var("ProgramFiles(x86)").unwrap();
+        cmd = Command::new(programFiles + "\\Microsoft Visual Studio\\Installer\\vswhere.exe");
+        cmd.args(&["-find", "**\\vcvarsall.bat"]);
+        let vswhere_output = execute_stdout(cmd);
+        let location = std::str::from_utf8(&vswhere_output).unwrap().trim();
+        println!("$ #found vcvarsall.bat at: {}", location);
+
+        println!("$ #Check for system MPIR");
+        create_file_or_panic(&try_dir.join("system_mpir.vcxproj"), WINDOWS_SYSTEM_MPIR_C_VCXPROJ);
+        create_file_or_panic(&try_dir.join("system_mpir.c"), SYSTEM_MPIR_C);
+
+        cmd = Command::new("cmd");
+        cmd.current_dir(&try_dir)
+            .args(&["/c", location, "x64", "&&", "msbuild", "/p:Configuration=Release", "system_mpir.vcxproj"]);
+        let msbuild_raw_output = execute_stdout(cmd);
+        let msbuild_output = std::str::from_utf8(&msbuild_raw_output).unwrap();
+        println!("{}", msbuild_output);
+        // yick
+        let start = msbuild_output.find("mpir---->").unwrap() + 9;
+        let end = msbuild_output[start..].find("<").unwrap();
+        let lib_path = String::from(&msbuild_output[start..start+end]);
+        println!("$ #found lib_path {}", lib_path);
+        mpir_lib_path = Some(lib_path);
+
+        cmd = Command::new(try_dir.join("x64\\Release\\system_mpir.exe"));
+        cmd.current_dir(&try_dir);
+        execute(cmd);
+        process_gmp_header(
+            &try_dir.join("system_mpir.out"),
+            Some(&env.out_dir.join("gmp_h.rs")),
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{}", e));
+    
+    } else {
+        if env.target == Target::Msvc {
+            panic!("GMP is not supported on Windows (MSVC), please try the 'use-mpir' feature instead");
+        }
+
+        println!("$ #Check for system GMP");
+        create_file_or_panic(&try_dir.join("system_gmp.c"), SYSTEM_GMP_C);
+
+        cmd = Command::new("gcc");
+        cmd.current_dir(&try_dir)
+            .args(&["-fPIC", "system_gmp.c", "-lgmp", "-o", "system_gmp.exe"]);
+        execute(cmd);
+
+        cmd = Command::new(try_dir.join("system_gmp.exe"));
+        cmd.current_dir(&try_dir);
+        execute(cmd);
+        process_gmp_header(
+            &try_dir.join("system_gmp.out"),
+            Some(&env.out_dir.join("gmp_h.rs")),
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{}", e));
+    }
 
     if feature_mpfr {
+        if env.target == Target::Msvc {
+            panic!("feature 'mpfr' is not supported on Windows (MSVC)");
+        }
+
         println!("$ #Check for system MPFR");
         create_file_or_panic(&try_dir.join("system_mpfr.c"), SYSTEM_MPFR_C);
 
@@ -205,6 +258,10 @@ fn check_system_libs(env: &Environment) {
     }
 
     if feature_mpc {
+        if env.target == Target::Msvc {
+            panic!("the 'mpc' feature is not supported on Windows (MSVC)");
+        }
+        
         println!("$ #Check for system MPC");
         create_file_or_panic(&try_dir.join("system_mpc.c"), SYSTEM_MPC_C);
 
@@ -237,7 +294,7 @@ fn check_system_libs(env: &Environment) {
         }
     }
 
-    write_link_info(&env, feature_mpfr, feature_mpc);
+    write_link_info(&env, feature_mpfr, feature_mpc, feature_use_mpir, &mpir_lib_path);
 }
 
 fn compile_libs(env: &Environment) {
@@ -287,7 +344,7 @@ fn compile_libs(env: &Environment) {
             clear_cache_redundancies(&env, mpfr_ah.is_some(), mpc_ah.is_some());
         }
     }
-    process_gmp_header(&gmp_ah.1, Some(&env.out_dir.join("gmp_h.rs")))
+    process_gmp_header(&gmp_ah.1, Some(&env.out_dir.join("gmp_h.rs")), false)
         .unwrap_or_else(|e| panic!("{}", e));
     if let Some(ref mpfr_ah) = mpfr_ah {
         process_mpfr_header(&mpfr_ah.1, Some(&env.out_dir.join("mpfr_h.rs")))
@@ -297,7 +354,7 @@ fn compile_libs(env: &Environment) {
         process_mpc_header(&mpc_ah.1, Some(&env.out_dir.join("mpc_h.rs")))
             .unwrap_or_else(|e| panic!("{}", e));
     }
-    write_link_info(&env, mpfr_ah.is_some(), mpc_ah.is_some());
+    write_link_info(&env, mpfr_ah.is_some(), mpc_ah.is_some(), false, &None);
 }
 
 fn get_version() -> (String, Option<u64>) {
@@ -505,7 +562,7 @@ fn load_cache(
         let (ref a, ref h) = *gmp_ah;
         ok = ok && copy_file(&version_dir.join("libgmp.a"), a).is_ok();
         let header = version_dir.join("gmp.h");
-        ok = ok && process_gmp_header(&header, None).is_ok();
+        ok = ok && process_gmp_header(&header, None, false).is_ok();
         ok = ok && copy_file(&header, h).is_ok();
 
         if ok {
@@ -564,10 +621,14 @@ fn build_gmp(env: &Environment, lib: &Path, header: &Path) {
 }
 
 fn compatible_version(major: i32, minor: i32, patchlevel: i32, expected: (i32, i32, i32)) -> bool {
-    major == expected.0 && (minor > expected.1 || (minor == expected.1 && patchlevel >= expected.2))
+    compatible_version_check(major, minor, patchlevel, expected, false)
 }
 
-fn process_gmp_header(header: &Path, out_file: Option<&Path>) -> Result<(), String> {
+fn compatible_version_check(major: i32, minor: i32, patchlevel: i32, expected: (i32, i32, i32), lenient: bool) -> bool {
+    major == expected.0 && (lenient || (minor > expected.1 || (minor == expected.1 && patchlevel >= expected.2)))
+}
+
+fn process_gmp_header(header: &Path, out_file: Option<&Path>, lenient_version: bool) -> Result<(), String> {
     let mut major = None;
     let mut minor = None;
     let mut patchlevel = None;
@@ -630,7 +691,7 @@ fn process_gmp_header(header: &Path, out_file: Option<&Path>) -> Result<(), Stri
     let major = major.expect("Cannot determine __GNU_MP_VERSION");
     let minor = minor.expect("Cannot determine __GNU_MP_VERSION_MINOR");
     let patchlevel = patchlevel.expect("Cannot determine __GNU_MP_VERSION_PATCHLEVEL");
-    if !compatible_version(major, minor, patchlevel, GMP_VER) {
+    if !compatible_version_check(major, minor, patchlevel, GMP_VER, lenient_version) {
         return Err(format!(
             "This version of gmp-mpfr-sys supports GMP {}.{}.{}, but {}.{}.{} was found",
             GMP_VER.0, GMP_VER.1, GMP_VER.2, major, minor, patchlevel
@@ -852,7 +913,12 @@ fn build_mpc(env: &Environment, lib: &Path, header: &Path) {
     copy_file_or_panic(&src_header, &header);
 }
 
-fn write_link_info(env: &Environment, feature_mpfr: bool, feature_mpc: bool) {
+fn write_link_info(
+    env: &Environment,
+    feature_mpfr: bool,
+    feature_mpc: bool,
+    feature_use_mpir: bool,
+    mpir_lib_path: &Option<String>) {
     let out_str = env.out_dir.to_str().unwrap_or_else(|| {
         panic!(
             "Path contains unsupported characters, can only make {}",
@@ -882,7 +948,15 @@ fn write_link_info(env: &Environment, feature_mpfr: bool, feature_mpc: bool) {
     if feature_mpfr {
         println!("cargo:rustc-link-lib={}mpfr", maybe_static);
     }
-    println!("cargo:rustc-link-lib={}gmp", maybe_static);
+    if feature_use_mpir {
+        if let Some(path) = mpir_lib_path {
+            println!("cargo:rustc-link-search=native={}", path);
+        }
+
+        println!("cargo:rustc-link-lib={}mpir",  maybe_static);
+    } else {
+        println!("cargo:rustc-link-lib={}gmp", maybe_static);
+    }
     if env.target == Target::Mingw {
         if env.workaround_47048 == Workaround47048::Yes {
             println!("cargo:rustc-link-lib=static=workaround_47048");
@@ -948,7 +1022,7 @@ fn there_is_env(name: &str) -> bool {
 
 fn check_for_msvc(env: &Environment) {
     if env.target == Target::Msvc {
-        panic!("Windows MSVC target is not supported (linking would fail)");
+        panic!("Windows (MSVC) target is not supported for building GMP from source (linking would fail). The feature combination 'use-system-libs use-mpir' is supported on Windows (MSVC).");
     }
 }
 
@@ -1322,6 +1396,190 @@ int main(void) {
 
     return 0;
 }
+"##;
+
+// prints part of the header
+const SYSTEM_MPIR_C: &str = r##"/* system_mpir.c */
+#include <gmp.h>
+#include <stdio.h>
+
+#define STRINGIFY(x) #x
+#define DEFINE_STR(x) ("#define " #x " " STRINGIFY(x) "\n")
+
+int main(void) {
+    FILE *f = fopen("system_mpir.out", "w");
+
+#ifdef _LONG_LONG_LIMB
+    fputs(DEFINE_STR(_LONG_LONG_LIMB), f);
+#else
+    fputs("#undef _LONG_LONG_LIMB\n", f);
+#endif
+
+    fputs(DEFINE_STR(__GNU_MP_VERSION), f);
+    fputs(DEFINE_STR(__GNU_MP_VERSION_MINOR), f);
+    fputs(DEFINE_STR(__GNU_MP_VERSION_PATCHLEVEL), f);
+    fputs(DEFINE_STR(GMP_LIMB_BITS), f);
+    fputs(DEFINE_STR(GMP_NAIL_BITS), f);
+    fputs(DEFINE_STR(__GMP_CC), f);
+    fputs(DEFINE_STR(__GMP_CFLAGS), f);
+
+    fclose(f);
+
+    return 0;
+}
+"##;
+
+const WINDOWS_SYSTEM_MPIR_C_VCXPROJ: &str = r##"<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>16.0</VCProjectVersion>
+    <ProjectGuid>{619B4E76-DBF0-49BF-9178-70AA6F50B25F}</ProjectGuid>
+    <RootNamespace>Test</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <VcpkgTriplet Condition="'$(Platform)'=='Win32'">x86-windows-static</VcpkgTriplet>
+    <VcpkgTriplet Condition="'$(Platform)'=='x64'">x64-windows-static</VcpkgTriplet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v142</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v142</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v142</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v142</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <LinkIncremental>true</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <LinkIncremental>true</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="system_mpir.c" />
+  </ItemGroup>
+  <Target Name="PrintMPIRDir" BeforeTargets="Build">
+    <Message Importance="High" Text="mpir----&gt;$(VcpkgCurrentInstalledDir)\lib\&lt;----" />
+  </Target>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>
 "##;
 
 // prints part of the header

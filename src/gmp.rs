@@ -49,9 +49,15 @@ include!(concat!(env!("OUT_DIR"), "/gmp_h.rs"));
 
 extern "C" {
     /// See: [`mp_bits_per_limb`](../C/GMP/constant.GMP_Basics.html#index-mp_005fbits_005fper_005flimb)
+    #[cfg(not(feature = "use-mpir"))]
     #[link_name = "__gmp_bits_per_limb"]
     pub static bits_per_limb: c_int;
+
 }
+
+#[cfg(feature = "use-mpir")]
+pub static bits_per_limb: c_int = 64;
+
 /// See: [`__GNU_MP_VERSION`](../C/GMP/constant.GMP_Basics.html#index-_005f_005fGNU_005fMP_005fVERSION)
 pub const VERSION: c_int = GMP_VERSION;
 /// See: [`__GNU_MP_VERSION_MINOR`](../C/GMP/constant.GMP_Basics.html#index-_005f_005fGNU_005fMP_005fVERSION_005fMINOR)
@@ -1867,6 +1873,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "use-mpir"))]
     fn check_version() {
         use crate::tests;
 

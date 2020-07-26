@@ -25,6 +25,7 @@ default = ["mpfr", "mpc"]
 mpfr = []
 mpc = ["mpfr"]
 use-system-libs = []
+use-mpir = []
 fail-on-warnings = []
 force-cross = []
 
